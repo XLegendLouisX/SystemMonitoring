@@ -5,9 +5,7 @@ namespace SystemMonitoring
     using System.Diagnostics;
     using System.Management;
     using System.Net;
-    using System.Net.Http.Headers;
     using System.Net.Http;
-    using System.Text;
     using System.Text.Json;
     using System.Threading;
     using System.Threading.Tasks;
@@ -29,6 +27,7 @@ namespace SystemMonitoring
         private int _notifyInterval = 0;
         private int _runInterval = 5000;
         private int _storageDays = 60;
+        private int _sharedJsonTotal = 0;
         private string _localPath;
         private string _sharedPath;
         private string _taskPath;
@@ -48,6 +47,7 @@ namespace SystemMonitoring
             _notifyInterval = configuration.GetValue<int>("WorkerSettings:NotifyInterval");
             _runInterval = configuration.GetValue<int>("WorkerSettings:RunInterval");
             _storageDays = configuration.GetValue<int>("WorkerSettings:StorageDays");
+            _sharedJsonTotal = configuration.GetValue<int>("WorkerSettings:SharedJsonTotal");
             _localPath = configuration.GetValue<string>("WorkerSettings:LocalPath");
             _sharedPath = configuration.GetValue<string>("WorkerSettings:SharedPath");
             _taskPath = configuration.GetValue<string>("WorkerSettings:TaskPath");
@@ -67,25 +67,18 @@ namespace SystemMonitoring
             {
                 _storageDays = 1;
             }
+
+            if (_sharedJsonTotal < 0)
+            {
+                _sharedJsonTotal = 0;
+            }
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             try
             {
-                // 確保 Log 路徑存在
-                if (Directory.Exists(_localPath) == false)
-                {
-                    Directory.CreateDirectory(_localPath);
-                }
-
-                // 生成日期資料夾
-                string dateFolder = DateTime.Now.ToString("yyyyMMdd");
-                string dateFolderPath = Path.Combine(_localPath, dateFolder);
-                if (Directory.Exists(dateFolderPath) == false)
-                {
-                    Directory.CreateDirectory(dateFolderPath);
-                }
+                string result_delete = "";
 
                 // 取得本機 IP
                 string hostIp = GetLocalIp();
@@ -94,6 +87,9 @@ namespace SystemMonitoring
 
                 while (!stoppingToken.IsCancellationRequested)
                 {
+                    string loaclPath = CreateFile(_localPath);
+                    string sharedPath = CreateFile(_sharedPath);
+
                     // 監測
                     float cpuUsage = _cpuCounter.NextValue();
                     float availableRam = _ramCounter.NextValue();
@@ -104,18 +100,13 @@ namespace SystemMonitoring
                     List<string> notifyRecord = new List<string>();
                     // 監測
 
-                    // 產生檔案前再次檢查資料夾是否存在
-                    // URL請求比較花時間，若這段時間手段刪除資料夾會有問題
-                    if (Directory.Exists(dateFolderPath) == false)
-                    {
-                        Directory.CreateDirectory(dateFolderPath);
-                    }
-
                     // 動態生成 Log 檔案名稱
                     var timestamp = DateTime.Now;
                     var logFileName = $"SM_{hostIp}_{timestamp:yyyyMMdd}.json";
-                    var logFilePath = Path.Combine(dateFolderPath, logFileName);
-                    var logEntry = new SystemMonitorJson()
+                    var loaclFilePath = Path.Combine(loaclPath, logFileName);
+                    var sharedFilePath = Path.Combine(sharedPath, Path.GetFileName(loaclFilePath));
+
+                    SystemMonitorJson systemMonitorJson = new SystemMonitorJson()
                     {
                         HostIp = hostIp,
                         Timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
@@ -124,17 +115,37 @@ namespace SystemMonitoring
                         DiskUsage = diskUsage.Select(i => new DiskUsageEntry { Drive = i.Key, Usage = $"{i.Value:0.00}%" }).ToList(),
                         UrlStatus = urlStatus.Select(i => new UrlStatusEntry { Url = i.Key, Status = i.Value }).ToList(),
                         TaskLogs = taskLogs.Select(i => new TaskLogEntry { Name = i.Key, Status = i.Value }).ToList(),
-                        NotifyInterval = _notifyInterval,
-                        NotifyRecord = notifyRecord
                     };
-                    var logJson = logEntry.ToJson();
-                    await File.AppendAllTextAsync(logFilePath, logJson + Environment.NewLine, stoppingToken);
-                    // 動態生成 Log 檔案名稱
 
-                    // 更新共享資料夾Json檔
-                    string result_transmit = TransmitJsonToTarget(logFilePath, logJson);
-                    // 刪除過期檔案
-                    string result_delete = DeleteOldFolders();
+                    // 產生檔案前再次檢查資料夾是否存在
+                    // URL請求比較花時間，若這段時間手段刪除資料夾會有問題
+                    if (Directory.Exists(loaclPath) == true)
+                    {
+                        //==========本機==========//
+                        // 讀取現有資料
+                        SystemMonitor systemMonitor = await ReadJsonFileAsync(loaclFilePath);
+                        // 新增資料到現有資料中
+                        systemMonitor.JsonList.Add(systemMonitorJson);
+                        systemMonitor.NotifyInterval = _notifyInterval;
+                        systemMonitor.NotifyRecord = notifyRecord;
+                        // 寫回檔案
+                        await WriteJsonFileAsync(loaclFilePath, systemMonitor);
+                        //==========本機==========//
+
+                        //==========遠端==========//
+                        if (Directory.Exists(sharedPath) == true)
+                        {
+                            // 讀取現有資料
+                            systemMonitor = await ReadJsonFileAsync(loaclFilePath);
+                            // 更新共享資料夾Json檔
+                            SystemMonitor newData = GetDataByQuantity(systemMonitor);
+                            // 寫回檔案
+                            await WriteJsonFileAsync(sharedFilePath, newData);
+                            // 刪除過期檔案
+                            result_delete = DeleteOldFolders();
+                        }
+                        //==========遠端==========//
+                    }
 
                     _logger.LogInformation($"CPU 使用率: {cpuUsage:0.00}%");
                     _logger.LogInformation($"記憶體使用率: {ramUsage:0.00}%");
@@ -154,7 +165,6 @@ namespace SystemMonitoring
                         _logger.LogInformation($"排程 {log.Key}, 狀態 {log.Value}");
                     }
 
-                    _logger.LogInformation(result_transmit);
                     _logger.LogInformation(result_delete);
 
                     await Task.Delay(_runInterval, stoppingToken);
@@ -163,6 +173,65 @@ namespace SystemMonitoring
             catch (Exception ex)
             {
                 _logger.LogInformation($"Error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 建立Json路徑
+        /// </summary>
+        /// <param name="path"></param>
+        /// <returns></returns>
+        private string CreateFile(string path)
+        {
+            string newPath = path;
+
+            // 確保 Log 路徑存在
+            if (Directory.Exists(path) == false)
+            {
+                Directory.CreateDirectory(path);
+            }
+
+            // 生成日期資料夾
+            string dateFolder = DateTime.Now.ToString("yyyyMMdd");
+            string dateFolderPath = Path.Combine(path, dateFolder);
+            if (Directory.Exists(dateFolderPath) == false)
+            {
+                Directory.CreateDirectory(dateFolderPath);
+            }
+            newPath = dateFolderPath;
+
+            return newPath;
+        }
+
+        /// <summary>
+        /// 讀取Json檔
+        /// </summary>
+        /// <param name="filePath"></param>
+        /// <returns></returns>
+        private async Task<SystemMonitor> ReadJsonFileAsync(string filePath)
+        {
+            if (!File.Exists(filePath))
+            {
+                return new SystemMonitor();
+            }
+
+            using (FileStream fs = File.OpenRead(filePath))
+            {
+                return await JsonSerializer.DeserializeAsync<SystemMonitor>(fs);
+            }
+        }
+
+        /// <summary>
+        /// 寫入Json檔
+        /// </summary>
+        /// <param name="filePath"></param>
+        /// <param name="data"></param>
+        /// <returns></returns>
+        private async Task WriteJsonFileAsync(string filePath, SystemMonitor data)
+        {
+            using (FileStream fs = File.Create(filePath))
+            {
+                await JsonSerializer.SerializeAsync(fs, data, new JsonSerializerOptions { WriteIndented = true });
             }
         }
 
@@ -325,94 +394,33 @@ namespace SystemMonitoring
         /// </summary>
         /// <param name="localFilePath"></param>
         /// <returns></returns>
-        private string TransmitJsonToTarget(string localFilePath,
-                                            string logJson
-                                            )
+        private SystemMonitor GetDataByQuantity(SystemMonitor loaclSystemMonitor)
         {
             string result = "";
+            SystemMonitor systemMonitor = new SystemMonitor();
             try
             {
-                // 解析 JSON 檔案為 JsonObject
-                var jsonObject = JsonSerializer.Deserialize<SystemMonitorJson>(logJson);
-
-                // 設定目標主機的共享資料夾
-                string targetFolderPath = _sharedPath;
-
-                // 確保共享資料夾存在
-                if (Directory.Exists(targetFolderPath) == false)
+                systemMonitor = loaclSystemMonitor;
+                if (_sharedJsonTotal > 0)
                 {
-                    result = $"Target folder not found: {targetFolderPath}";
+                    List<SystemMonitorJson> newJsonList = new List<SystemMonitorJson>();
+                    for (int i = systemMonitor.JsonList.Count; systemMonitor.JsonList.Count < i; i--)
+                    {
+                        if (i == systemMonitor.JsonList.Count)
+                        {
+                            newJsonList.Add(systemMonitor.JsonList[i]);
+                        }
+                    }
+                    systemMonitor.JsonList = newJsonList;
                 }
 
-                // 生成日期資料夾
-                string dateFolder = DateTime.Now.ToString("yyyyMMdd");
-                targetFolderPath = Path.Combine(targetFolderPath, dateFolder);
-                if (Directory.Exists(targetFolderPath) == false)
-                {
-                    Directory.CreateDirectory(targetFolderPath);
-                }
-
-                // 只更新最新的一筆
-                string targetFilePath = Path.Combine(targetFolderPath, Path.GetFileName(localFilePath));
-                if (File.Exists(targetFilePath) == true)
-                {
-                    UpdateShareJson(targetFilePath, logJson);
-                }
-                else
-                {
-                    File.AppendAllTextAsync(targetFilePath, logJson + Environment.NewLine);
-                }
-
-                // 複製檔案到目標資料夾
-                //string targetFilePath = Path.Combine(targetFolderPath, Path.GetFileName(localFilePath));
-                //File.Copy(localFilePath, targetFilePath, overwrite: true);
-
-                result = $"JSON file transmitted to: {targetFilePath}";
+                return systemMonitor;
             }
             catch (Exception ex)
             {
-                result = $"Error transmitting JSON to target: {ex.Message}";
+                result = $"Error: {ex.Message}";
             }
-            return result;
-        }
-
-        /// <summary>
-        /// 使用本機最新一筆Json更新共享資料夾的Json
-        /// </summary>
-        /// <param name="targetFilePath">共享資料夾路徑</param>
-        /// <param name="logJson">本機Json</param>
-        public void UpdateShareJson(string targetFilePath, string logJson)
-        {
-            /// 取得 JSON 檔案的路徑
-            string filePath = targetFilePath;
-
-            // 讀取 JSON 檔案內容
-            string jsonContent = File.ReadAllText(filePath);
-
-            // 解析 JSON 檔案為 JsonObject
-            var loaclJson = JsonSerializer.Deserialize<SystemMonitorJson>(logJson);
-            var shareJson = JsonSerializer.Deserialize<SystemMonitorJson>(jsonContent);
-
-            if (shareJson != null)
-            {
-                List<string> notifyRecordList = shareJson.GetNotifyRecord();
-                loaclJson.NotifyRecord = notifyRecordList;
-
-                var logEntry = new SystemMonitorJson()
-                {
-                    HostIp = loaclJson.HostIp,
-                    Timestamp = loaclJson.Timestamp,
-                    CpuUsage = loaclJson.CpuUsage,
-                    MemoryUsage = loaclJson.MemoryUsage,
-                    DiskUsage = loaclJson.DiskUsage,
-                    UrlStatus = loaclJson.UrlStatus,
-                    TaskLogs = loaclJson.TaskLogs,
-                    NotifyInterval = loaclJson.NotifyInterval,
-                    NotifyRecord = loaclJson.NotifyRecord
-                };
-                string updatedJson = logEntry.ToJson();
-                File.WriteAllText(filePath, updatedJson);
-            }
+            return systemMonitor;
         }
 
         /// <summary>

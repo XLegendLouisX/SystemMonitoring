@@ -3,25 +3,15 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 
-public class SystemMonitorJson
+public class SystemMonitor
 {
-    public string HostIp { get; set; }
-    public string Timestamp { get; set; }
-    public string CpuUsage { get; set; }
-    public string MemoryUsage { get; set; }
-    public List<DiskUsageEntry> DiskUsage { get; set; }
-    public List<UrlStatusEntry> UrlStatus { get; set; }
-    public List<TaskLogEntry> TaskLogs { get; set; }
     public int NotifyInterval { get; set; }
     public List<string> NotifyRecord { get; set; }
+    public List<SystemMonitorJson> JsonList { get; set; }
 
-    // 無參數建構子
-    public SystemMonitorJson() { }
-
-    // 將物件序列化為 JSON
-    public string ToJson()
+    public SystemMonitor() 
     {
-        return JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
+        JsonList = new List<SystemMonitorJson>();
     }
 
     // **取得 NotifyRecord 清單**
@@ -46,6 +36,23 @@ public class SystemMonitorJson
     public void UpdateNotifyRecord(List<string> newRecords)
     {
         NotifyRecord = newRecords;
+    }
+}
+
+public class SystemMonitorJson
+{
+    public string HostIp { get; set; }
+    public string Timestamp { get; set; }
+    public string CpuUsage { get; set; }
+    public string MemoryUsage { get; set; }
+    public List<DiskUsageEntry> DiskUsage { get; set; }
+    public List<UrlStatusEntry> UrlStatus { get; set; }
+    public List<TaskLogEntry> TaskLogs { get; set; }
+
+    // 將物件序列化為 JSON
+    public string ToJson()
+    {
+        return JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
     }
 
     // 子類別 - 磁碟使用率
