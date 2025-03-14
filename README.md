@@ -33,6 +33,7 @@ Json檔目前會記錄在兩個路徑，一個是本機，另一個是共享資�
   "UrlHost": 0, //是否監控URL(0:否,1:是)
   "RunInterval": 5000, //執行間隔(毫秒)
   "StorageDays": 60, //json保存天數
+  "SharedJsonTotal": 0, //寫入共享資料夾Json數量(0:不限制)
   "LocalPath": "D:\\SystemMonitoringLogs", //本機資料夾路徑
   "SharedPath": "\\\\{ip}\\Share", //共享資料夾路徑
   "TaskPath": "\\", //排程路徑
