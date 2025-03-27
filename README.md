@@ -70,7 +70,7 @@ Json檔目前會記錄在兩個路徑，一個是本機，另一個是共享資�
 ### 建立背景執行:<br/>
 命令提示字元(系統管理員)<br/>
 1. 建立服務<br/>
-```sc create "System Monitoring" binPath="執行檔路徑"```<br/>
+```sc create "System Monitoring" binPath="執行檔路徑" start=auto```<br/>
 2. 執行服務<br/>
 ```sc start "System Monitoring"```<br/>
 備註:System Monitoring可在「開始」搜尋「服務」裡找到。<br/>
