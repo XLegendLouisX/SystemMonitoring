@@ -78,21 +78,25 @@ namespace SystemMonitoring
         {
             try
             {
-                string result_delete = "";
-
                 // 取得本機 IP
                 string hostIp = GetLocalIp();
-                // 取得記憶體空間
-                var totalMemory = GetTotalMemory();
+
+                // CPU第一次讀取需要花點時間，這邊先讀取一次，避免後面取值為0
+                _cpuCounter.NextValue();
+                // 等待1秒
+                await Task.Delay(1000, stoppingToken);
 
                 while (!stoppingToken.IsCancellationRequested)
                 {
+                    string result_delete = "";
+
                     string loaclPath = CreateFile(_localPath);
                     string sharedPath = CreateFile(_sharedPath);
 
                     // 監測
                     float cpuUsage = _cpuCounter.NextValue();
                     float availableRam = _ramCounter.NextValue();
+                    double totalMemory = GetTotalMemory(); // 取得記憶體空間
                     double ramUsage = ((totalMemory - availableRam) / totalMemory) * 100; // 計算記憶體使用率
                     Dictionary<string, double> diskUsage = GetDiskUsage();
                     Dictionary<string, int> urlStatus = GetUrlStatus().Result;
