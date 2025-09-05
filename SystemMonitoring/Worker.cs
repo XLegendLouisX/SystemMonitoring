@@ -1,4 +1,4 @@
-namespace SystemMonitoring
+ï»¿namespace SystemMonitoring
 {
     using System;
     using System.ComponentModel;
@@ -13,9 +13,14 @@ namespace SystemMonitoring
     using Microsoft.Extensions.Logging;
     using TaskScheduler = Microsoft.Win32.TaskScheduler;
     using static SystemMonitorJson;
+    using System.Collections.Generic;
+    using System.IO;
+    using System.Linq;
 
     public class Worker : BackgroundService
     {
+        private readonly HttpClient _httpClient;
+
         private readonly ILogger<Worker> _logger;
         private readonly PerformanceCounter _cpuCounter;
         private readonly PerformanceCounter _ramCounter;
@@ -25,18 +30,37 @@ namespace SystemMonitoring
         private int _urlHost = 0;
 
         private int _notifyInterval = 0;
-        private int _runInterval = 5000;
         private int _storageDays = 60;
         private int _sharedJsonTotal = 0;
+        private int _requestTimeout = 60;
         private string _localPath;
         private string _sharedPath;
         private string _taskPath;
         private string[] url_list = { };
 
+        // === åˆ†æ™‚æ®µæª¢æ¸¬ === //
+        private TimeSpan _diskEvery;
+        private TimeSpan _urlEvery;
+        private TimeSpan _taskEvery;
+
+        private DateTimeOffset _nextDisk;
+        private DateTimeOffset _nextUrl;
+        private DateTimeOffset _nextTask;
+
+        private TimeZoneInfo _tz; // ç›®æ¨™æ™‚å€ï¼ˆå°åŒ—ï¼‰
+
+        // === å¿«å–ï¼šåˆ†åˆ¥ç”±å„è‡ªæ’ç¨‹æ›´æ–°ï¼Œå¯«æª”æ™‚çµ„åˆ ===
+        private float _lastCpuUsage;
+        private double _lastRamUsage;
+        private Dictionary<string, double> _lastDiskUsage = new();
+        private Dictionary<string, (int, string)> _lastUrlStatus = new();
+        private Dictionary<string, (string, string)> _lastTaskLogs = new();
+        // === åˆ†æ™‚æ®µæª¢æ¸¬ === //
+
         public Worker(ILogger<Worker> logger, IConfiguration configuration)
         {
             _logger = logger;
-            // ªì©l¤Æ©Ê¯à­p¼Æ¾¹
+            // åˆå§‹åŒ–æ€§èƒ½è¨ˆæ•¸å™¨ï¼ˆWindowsï¼‰
             _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
             _ramCounter = new PerformanceCounter("Memory", "Available MBytes");
 
@@ -45,192 +69,232 @@ namespace SystemMonitoring
             _urlHost = configuration.GetValue<int>("WorkerSettings:UrlHost");
 
             _notifyInterval = configuration.GetValue<int>("WorkerSettings:NotifyInterval");
-            _runInterval = configuration.GetValue<int>("WorkerSettings:RunInterval");
             _storageDays = configuration.GetValue<int>("WorkerSettings:StorageDays");
             _sharedJsonTotal = configuration.GetValue<int>("WorkerSettings:SharedJsonTotal");
+            _requestTimeout = configuration.GetValue<int>("WorkerSettings:RequestTimeout");
             _localPath = configuration.GetValue<string>("WorkerSettings:LocalPath");
             _sharedPath = configuration.GetValue<string>("WorkerSettings:SharedPath");
             _taskPath = configuration.GetValue<string>("WorkerSettings:TaskPath");
-            url_list = configuration.GetSection("WorkerSettings:HttpUrls").Get<string[]>();
+            url_list = configuration.GetSection("WorkerSettings:HttpUrls").Get<string[]>() ?? Array.Empty<string>();
 
-            if (_notifyInterval < 0)
-            {
-                _notifyInterval = 0;
-            }
+            if (_notifyInterval < 0) _notifyInterval = 0;
+            if (_storageDays < 1) _storageDays = 1;
+            if (_sharedJsonTotal < 0) _sharedJsonTotal = 0;
+            if (_requestTimeout < 10) _requestTimeout = 10;
 
-            if (_runInterval <= 1000)
+            var handler = new HttpClientHandler
             {
-                _runInterval = 1000;
-            }
+                ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => true
+            };
 
-            if (_storageDays < 1)
+            _httpClient = new HttpClient(handler)
             {
-                _storageDays = 1;
-            }
+                Timeout = TimeSpan.FromSeconds(_requestTimeout)
+            };
 
-            if (_sharedJsonTotal < 0)
-            {
-                _sharedJsonTotal = 0;
-            }
+            // === è®€å–åˆ†æµæ’ç¨‹ï¼ˆè‹¥æœªè¨­å®šçµ¦é è¨­å€¼ï¼‰ ===
+            int diskMin = Math.Max(1, configuration.GetValue<int>("WorkerSettings:DiskEveryMinutes", 1));
+            int urlMin = Math.Max(1, configuration.GetValue<int>("WorkerSettings:UrlEveryMinutes", 1));
+            int taskMin = Math.Max(1, configuration.GetValue<int>("WorkerSettings:TaskEveryMinutes", 1));
+
+            _diskEvery = TimeSpan.FromMinutes(diskMin);
+            _urlEvery = TimeSpan.FromMinutes(urlMin);
+            _taskEvery = TimeSpan.FromMinutes(taskMin);
+
+            // å°åŒ—æ™‚å€
+            _tz = TimeFunction.GetTaipeiTimeZone();
+
+            // å°é½Šåˆ°ã€Œä¸‹ä¸€å€‹æ•´ N åˆ†é˜ã€æ™‚é–“é»ï¼ˆä¾‹å¦‚ 00/10/20/30...ï¼‰
+            var now = DateTimeOffset.UtcNow;
+            _nextDisk = TimeFunction.GetNextByInterval(now, diskMin, _tz);
+            _nextUrl = TimeFunction.GetNextByInterval(now, urlMin, _tz);
+            _nextTask = TimeFunction.GetNextByInterval(now, taskMin, _tz);
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            try
+            // é ç†± CPU è¨ˆæ•¸å™¨
+            _cpuCounter.NextValue();
+            await Task.Delay(1000, stoppingToken);
+
+            string hostIp = GetLocalIp();
+
+            while (!stoppingToken.IsCancellationRequested)
             {
-                // ¨ú±o¥»¾÷ IP
-                string hostIp = GetLocalIp();
-
-                // CPU²Ä¤@¦¸Åª¨ú»İ­nªáÂI®É¶¡¡A³oÃä¥ıÅª¨ú¤@¦¸¡AÁ×§K«á­±¨ú­È¬°0
-                _cpuCounter.NextValue();
-                // µ¥«İ1¬í
-                await Task.Delay(1000, stoppingToken);
-
-                while (!stoppingToken.IsCancellationRequested)
+                try
                 {
-                    string result_delete = "";
+                    // æ‰¾å‡ºä¸‹ä¸€å€‹æœ€è¿‘è¦åŸ·è¡Œçš„æ™‚é–“
+                    DateTimeOffset now = DateTimeOffset.UtcNow;
+                    DateTimeOffset next = TimeFunction.Min(_nextDisk, _nextUrl, _nextTask);
 
-                    string loaclPath = CreateFile(_localPath);
-                    string sharedPath = CreateFile(_sharedPath);
+                    var delay = next - now;
+                    if (delay > TimeSpan.Zero)
+                        await Task.Delay(delay, stoppingToken);
 
-                    // ºÊ´ú
-                    float cpuUsage = _cpuCounter.NextValue();
-                    float availableRam = _ramCounter.NextValue();
-                    double totalMemory = GetTotalMemory(); // ¨ú±o°O¾ĞÅéªÅ¶¡
-                    double ramUsage = ((totalMemory - availableRam) / totalMemory) * 100; // ­pºâ°O¾ĞÅé¨Ï¥Î²v
-                    Dictionary<string, double> diskUsage = GetDiskUsage();
-                    Dictionary<string, int> urlStatus = GetUrlStatus().Result;
-                    Dictionary<string, string> taskLogs = await GetTaskSchedulerLogsAsync();
-                    List<string> notifyRecord = new List<string>();
-                    // ºÊ´ú
+                    // åˆ°é»å¾Œåˆ¤æ–·å“ªäº›åˆ°æœŸï¼ˆå¯èƒ½å¤šå€‹åŒæ™‚åˆ°æœŸï¼‰
+                    now = DateTimeOffset.UtcNow;
+                    bool dueDisk = now >= _nextDisk;
+                    bool dueUrl = now >= _nextUrl;
+                    bool dueTask = now >= _nextTask;
 
-                    // °ÊºA¥Í¦¨ Log ÀÉ®×¦WºÙ
-                    var timestamp = DateTime.Now;
-                    var logFileName = $"SM_{hostIp}_{timestamp:yyyyMMdd}.json";
-                    var loaclFilePath = Path.Combine(loaclPath, logFileName);
-                    var sharedFilePath = Path.Combine(sharedPath, Path.GetFileName(loaclFilePath));
+                    if (!(dueDisk || dueUrl || dueTask))
+                        continue;
 
-                    SystemMonitorJson systemMonitorJson = new SystemMonitorJson()
+                    // **é—œéµï¼šä¸¦è¡ŒåŸ·è¡Œ**
+                    var tasks = new List<Task>();
+                    Task diskTask = Task.CompletedTask;
+                    Task<Dictionary<string, (int, string)>> urlTask = null;
+                    Task<Dictionary<string, (string, string)>> schedTask = null;
+
+                    // å»ºç«‹ä»»å‹™ï¼ŒåŒæ­¥ã€Œå…ˆæ’ä¸‹ä¸€æ¬¡æ™‚é–“ã€â†’ å³ä½¿æŸé …å·¥ä½œè¼ƒä¹…ä¹Ÿä¸æœƒæ¼‚ç§»
+                    if (dueDisk)
                     {
-                        HostIp = hostIp,
-                        Timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
-                        CpuUsage = $"{cpuUsage:0.00}%",
-                        MemoryUsage = $"{ramUsage:0.00}%",
-                        DiskUsage = diskUsage.Select(i => new DiskUsageEntry { Drive = i.Key, Usage = $"{i.Value:0.00}%" }).ToList(),
-                        UrlStatus = urlStatus.Select(i => new UrlStatusEntry { Url = i.Key, Status = i.Value }).ToList(),
-                        TaskLogs = taskLogs.Select(i => new TaskLogEntry { Name = i.Key, Status = i.Value }).ToList(),
-                    };
-
-                    // ²£¥ÍÀÉ®×«e¦A¦¸ÀË¬d¸ê®Æ§¨¬O§_¦s¦b
-                    // URL½Ğ¨D¤ñ¸ûªá®É¶¡¡A­Y³o¬q®É¶¡¤â¬q§R°£¸ê®Æ§¨·|¦³°İÃD
-                    if (Directory.Exists(loaclPath) == true)
+                        diskTask = UpdateSystemMetricsAsync();
+                        tasks.Add(diskTask);
+                        _nextDisk = _nextDisk.Add(_diskEvery);
+                    }
+                    if (dueUrl)
                     {
-                        //==========¥»¾÷==========//
-                        // Åª¨ú²{¦³¸ê®Æ
-                        SystemMonitor systemMonitor = await ReadJsonFileAsync(loaclFilePath);
-                        // ·s¼W¸ê®Æ¨ì²{¦³¸ê®Æ¤¤
-                        systemMonitor.JsonList.Add(systemMonitorJson);
-                        systemMonitor.NotifyInterval = _notifyInterval;
-                        systemMonitor.NotifyRecord = notifyRecord;
-                        // ¼g¦^ÀÉ®×
-                        await WriteJsonFileAsync(loaclFilePath, systemMonitor);
-                        //==========¥»¾÷==========//
-
-                        //==========»·ºİ==========//
-                        if (Directory.Exists(sharedPath) == true)
-                        {
-                            // Åª¨ú²{¦³¸ê®Æ
-                            systemMonitor = await ReadJsonFileAsync(loaclFilePath);
-                            // §ó·s¦@¨É¸ê®Æ§¨JsonÀÉ
-                            SystemMonitor newData = GetDataByQuantity(systemMonitor);
-                            // ¼g¦^ÀÉ®×
-                            await WriteJsonFileAsync(sharedFilePath, newData);
-                            // §R°£¹L´ÁÀÉ®×
-                            result_delete = DeleteOldFolders();
-                        }
-                        //==========»·ºİ==========//
+                        urlTask = GetUrlStatus();
+                        tasks.Add(urlTask);
+                        _nextUrl = _nextUrl.Add(_urlEvery);
+                    }
+                    if (dueTask)
+                    {
+                        schedTask = GetTaskSchedulerLogsAsync();
+                        tasks.Add(schedTask);
+                        _nextTask = _nextTask.Add(_taskEvery);
                     }
 
-                    _logger.LogInformation($"CPU ¨Ï¥Î²v: {cpuUsage:0.00}%");
-                    _logger.LogInformation($"°O¾ĞÅé¨Ï¥Î²v: {ramUsage:0.00}%");
-
-                    foreach (var disk in diskUsage)
+                    try
                     {
-                        _logger.LogInformation($"ºÏºĞ {disk.Key}, ¨Ï¥Î²v {disk.Value:0.00}%");
+                        await Task.WhenAll(tasks);
+                    }
+                    catch (Exception ex)
+                    {
+                        // è‹¥å…¶ä¸­ä¸€å€‹å¤±æ•—ï¼Œä»å˜—è©¦æ”¶é›†å…¶ä»–å·²å®Œæˆçµæœ
+                        _logger.LogError(ex, "ä¸¦è¡Œæª¢æ¸¬æ™‚ç™¼ç”Ÿä¾‹å¤–");
                     }
 
-                    foreach (var url in urlStatus)
-                    {
-                        _logger.LogInformation($"ºô§} {url.Key}, ª¬ºA {url.Value}");
-                    }
+                    // æ”¶é›†çµæœï¼ˆåªåœ¨è©²é¡ä»»å‹™æˆåŠŸå®Œæˆæ™‚è¦†å¯«å¿«å–ï¼‰
+                    if (dueUrl && urlTask is not null && urlTask.Status == TaskStatus.RanToCompletion)
+                        _lastUrlStatus = urlTask.Result;
 
-                    foreach (var log in taskLogs)
-                    {
-                        _logger.LogInformation($"±Æµ{ {log.Key}, ª¬ºA {log.Value}");
-                    }
+                    if (dueTask && schedTask is not null && schedTask.Status == TaskStatus.RanToCompletion)
+                        _lastTaskLogs = schedTask.Result;
 
-                    _logger.LogInformation(result_delete);
-
-                    await Task.Delay(_runInterval, stoppingToken);
+                    // ä»»ä½•ä¸€é …åˆ°æœŸéƒ½å¯«ä¸€æ¬¡å¿«ç…§ï¼ˆåˆä½µä¸‰é¡æœ€æ–°å¿«å–ï¼‰
+                    await WriteSnapshotAsync(GetLocalIp());
+                }
+                catch (TaskCanceledException)
+                {
+                    // æ­£å¸¸çµæŸ
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "æ’ç¨‹åŸ·è¡Œå¤±æ•—");
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
                 }
             }
-            catch (Exception ex)
+        }
+
+        // âœ… å·²æ”¹ç‚ºç”±å„æ’ç¨‹æ›´æ–°å¿«å–ï¼Œé€™è£¡è² è²¬åˆä½µèˆ‡å¯«æª”
+        private async Task WriteSnapshotAsync(string hostIp)
+        {
+            string localPath = CreateFile(_localPath);
+            string sharedPath = CreateFile(_sharedPath);
+
+            var timestamp = DateTime.Now;
+            var logFileName = $"SM_{hostIp}_{timestamp:yyyyMMdd}.json";
+            var localFilePath = Path.Combine(localPath, logFileName);
+            var sharedFilePath = Path.Combine(sharedPath, Path.GetFileName(localFilePath));
+
+            // çµ„åˆç›®å‰å¿«å–æˆä¸€ç­†è¨˜éŒ„
+            SystemMonitorJson systemMonitorJson = new SystemMonitorJson()
             {
-                _logger.LogInformation($"Error: {ex.Message}");
+                HostIp = hostIp,
+                Timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                CpuUsage = $"{_lastCpuUsage:0.00}%",
+                MemoryUsage = $"{_lastRamUsage:0.00}%",
+                DiskUsage = _lastDiskUsage.Select(i => new DiskUsageEntry { Drive = i.Key, Usage = $"{i.Value:0.00}%" }).ToList(),
+                UrlStatus = _lastUrlStatus.Select(i => new UrlStatusEntry { Url = i.Key, Status = i.Value.Item1, Message = i.Value.Item2 }).ToList(),
+                TaskLogs = _lastTaskLogs.Select(i => new TaskLogEntry { Name = i.Key, Status = i.Value.Item1, Status_Text = i.Value.Item2 }).ToList(),
+            };
+
+            if (Directory.Exists(localPath))
+            {
+                // ========== å…ˆè®€å…±äº«ï¼ˆæ‹¿åˆ° NotifyRecord ç­‰ï¼‰ ==========
+                SystemMonitor systemMonitor_shared = await ReadJsonFileAsync(sharedFilePath);
+
+                // ========== æœ¬æ©Ÿ ==========
+                SystemMonitor systemMonitor = await ReadJsonFileAsync(localFilePath);
+                systemMonitor.JsonList.Add(systemMonitorJson);
+                systemMonitor.NotifyInterval = _notifyInterval;
+
+                if (systemMonitor_shared.NotifyRecord.Count > 0)
+                    systemMonitor.NotifyRecord = systemMonitor_shared.NotifyRecord;
+
+                await WriteJsonFileAsync(localFilePath, systemMonitor);
+
+                // ========== åŒæ­¥åˆ°å…±äº« ==========
+                if (Directory.Exists(sharedPath))
+                {
+                    systemMonitor = await ReadJsonFileAsync(localFilePath);
+                    SystemMonitor newData = GetDataByQuantity(systemMonitor);
+                    await WriteJsonFileAsync(sharedFilePath, newData);
+
+                    string result_delete = DeleteOldFolders();
+                    if (!string.IsNullOrEmpty(result_delete))
+                        _logger.LogInformation(result_delete);
+                }
             }
         }
 
         /// <summary>
-        /// «Ø¥ßJson¸ô®|
+        /// å»ºç«‹Jsonè·¯å¾‘ï¼ˆä»¥æ—¥æœŸåˆ†è³‡æ–™å¤¾ï¼‰
         /// </summary>
-        /// <param name="path"></param>
-        /// <returns></returns>
         private string CreateFile(string path)
         {
             string newPath = path;
 
-            // ½T«O Log ¸ô®|¦s¦b
-            if (Directory.Exists(path) == false)
-            {
+            if (!Directory.Exists(path))
                 Directory.CreateDirectory(path);
-            }
 
-            // ¥Í¦¨¤é´Á¸ê®Æ§¨
             string dateFolder = DateTime.Now.ToString("yyyyMMdd");
             string dateFolderPath = Path.Combine(path, dateFolder);
-            if (Directory.Exists(dateFolderPath) == false)
-            {
+            if (!Directory.Exists(dateFolderPath))
                 Directory.CreateDirectory(dateFolderPath);
-            }
-            newPath = dateFolderPath;
 
+            newPath = dateFolderPath;
             return newPath;
         }
 
         /// <summary>
-        /// Åª¨úJsonÀÉ
+        /// è®€å–Jsonæª”ï¼ˆè‹¥ä¸å­˜åœ¨æˆ–è§£æå¤±æ•—å›å‚³ç©ºç‰©ä»¶ï¼‰
         /// </summary>
-        /// <param name="filePath"></param>
-        /// <returns></returns>
         private async Task<SystemMonitor> ReadJsonFileAsync(string filePath)
         {
             if (!File.Exists(filePath))
-            {
                 return new SystemMonitor();
-            }
 
-            using (FileStream fs = File.OpenRead(filePath))
+            try
             {
-                return await JsonSerializer.DeserializeAsync<SystemMonitor>(fs);
+                using (FileStream fs = File.OpenRead(filePath))
+                {
+                    var obj = await JsonSerializer.DeserializeAsync<SystemMonitor>(fs);
+                    return obj ?? new SystemMonitor(); // âš ï¸ é˜² null
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"è®€å– JSON æª”æ¡ˆå¤±æ•—: {filePath}, éŒ¯èª¤: {ex.Message}");
+                return new SystemMonitor();
             }
         }
 
         /// <summary>
-        /// ¼g¤JJsonÀÉ
+        /// å¯«å…¥Jsonæª”
         /// </summary>
-        /// <param name="filePath"></param>
-        /// <param name="data"></param>
-        /// <returns></returns>
         private async Task WriteJsonFileAsync(string filePath, SystemMonitor data)
         {
             using (FileStream fs = File.Create(filePath))
@@ -240,9 +304,34 @@ namespace SystemMonitoring
         }
 
         /// <summary>
-        /// ¨ú±o°O¾ĞÅé¸ê®Æ
+        /// æ¯æ¬¡åˆ°æœŸæ›´æ–°ç³»çµ±è³‡æºå¿«å–ï¼ˆCPU/RAM/Diskï¼‰
         /// </summary>
-        /// <returns></returns>
+        private async Task UpdateSystemMetricsAsync()
+        {
+            // CPU / RAM
+            float cpuUsage = _cpuCounter.NextValue();
+            float availableRam = _ramCounter.NextValue();
+            double totalMemory = GetTotalMemory();
+            double ramUsage = (totalMemory > 0) ? ((totalMemory - availableRam) / totalMemory) * 100 : 0;
+
+            _lastCpuUsage = cpuUsage;
+            _lastRamUsage = ramUsage;
+
+            // Disk
+            _lastDiskUsage = GetDiskUsage();
+
+            // å³æ™‚ logï¼ˆå¯ä¿ç•™/ç§»é™¤ï¼‰
+            _logger.LogInformation($"CPU ä½¿ç”¨ç‡: {cpuUsage:0.00}%");
+            _logger.LogInformation($"è¨˜æ†¶é«”ä½¿ç”¨ç‡: {ramUsage:0.00}%");
+            foreach (var d in _lastDiskUsage)
+                _logger.LogInformation($"ç£ç¢Ÿ {d.Key} ä½¿ç”¨ç‡ {d.Value:0.00}%");
+
+            await Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// å–å¾—è¨˜æ†¶é«”ç¸½é‡ï¼ˆMBï¼‰
+        /// </summary>
         private static double GetTotalMemory()
         {
             try
@@ -251,235 +340,172 @@ namespace SystemMonitoring
                 using (var searcher = new ManagementObjectSearcher(query))
                 {
                     foreach (var obj in searcher.Get())
-                    {
-                        return Convert.ToDouble(obj["TotalPhysicalMemory"]) / (1024 * 1024); // Âà´«¬° MB
-                    }
+                        return Convert.ToDouble(obj["TotalPhysicalMemory"]) / (1024 * 1024);
                 }
                 return 0;
             }
-            catch (Exception ex)
+            catch
             {
                 return 0;
             }
         }
 
         /// <summary>
-        /// ¨ú±oµwºĞ¸ê®Æ
+        /// å–å¾—ç¡¬ç¢Ÿä½¿ç”¨ç‡ï¼ˆ%ï¼‰
         /// </summary>
-        /// <returns></returns>
         private static Dictionary<string, double> GetDiskUsage()
         {
             try
             {
                 var driveInfo = DriveInfo.GetDrives()
-                .Where(d => d.IsReady && d.DriveType == DriveType.Fixed)
-                .ToDictionary(
-                    d => d.Name,
-                    d => (1 - (double)d.AvailableFreeSpace / d.TotalSize) * 100
-                );
+                    .Where(d => d.IsReady && d.DriveType == DriveType.Fixed)
+                    .ToDictionary(
+                        d => d.Name,
+                        d => (1 - (double)d.AvailableFreeSpace / d.TotalSize) * 100
+                    );
                 return driveInfo;
             }
-            catch (Exception ex)
+            catch
             {
                 return new Dictionary<string, double>();
             }
         }
 
         /// <summary>
-        /// ¨ú±oºô§}ª¬ºA
+        /// å–å¾—ç¶²å€ç‹€æ…‹
         /// </summary>
-        /// <returns></returns>
-        public async Task<Dictionary<string, int>> GetUrlStatus()
+        public async Task<Dictionary<string, (int, string)>> GetUrlStatus()
         {
-            string url = "";
-            Dictionary<string, int> result = new Dictionary<string, int>();
-            if (_urlHost == 0)
-            {
+            var result = new Dictionary<string, (int, string)>();
+            if (_urlHost == 0 || url_list.Length == 0)
                 return await Task.FromResult(result);
-            }
 
-            // ºô§}³X°İ
-            for (int i = 0; url_list.Length > i; i++)
+            foreach (var url in url_list)
             {
-                url = url_list[i];
                 try
                 {
-                    // ©¿²¤¾ÌÃÒ¿ù»~
-                    HttpClientHandler handler = new HttpClientHandler
-                    {
-                        ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => true
-                    };
-
-                    using (var client = new HttpClient(handler))
-                    {
-                        // ³]¸m¶W®É®É¶¡¡]¥i®Ú¾Ú»İ­n½Õ¾ã¡^
-                        client.Timeout = TimeSpan.FromSeconds(10);
-
-                        // µo°e GET ½Ğ¨D
-                        HttpResponseMessage response = await client.GetAsync(url);
-
-                        // ¦pªGªğ¦^¦¨¥\ª¬ºA½X¡A±N¨ä¦s¤Jµ²ªG
-                        result[url] = (int)response.StatusCode;
-                    }
+                    HttpResponseMessage response = await _httpClient.GetAsync(url);
+                    result[url] = ((int)response.StatusCode, "Success");
                 }
                 catch (Exception ex)
                 {
-                    // ¦pªG®·Àò¨ì²§±`¡A³]¸m¬°µLªk³s½uªºª¬ºA½X¡]¨Ò¦p 500¡^
-                    result[url] = 500;
+                    result[url] = (0, ex.Message);
                 }
             }
-
-            // ªğ¦^¦r¨åµ²ªG
             return result;
         }
 
         /// <summary>
-        /// ¨ú±o¤u§@±Æµ{
+        /// å–å¾—å·¥ä½œæ’ç¨‹ï¼ˆWindows å·¥ä½œæ’ç¨‹å™¨ï¼‰
         /// </summary>
-        /// <returns></returns>
-        public async Task<Dictionary<string, string>> GetTaskSchedulerLogsAsync()
+        public async Task<Dictionary<string, (string, string)>> GetTaskSchedulerLogsAsync()
         {
-            string result = "";
-            Dictionary<string, string> logs = new Dictionary<string, string>();
+            var logs = new Dictionary<string, (string, string)>();
             if (_taskHost == 0)
-            {
                 return await Task.FromResult(logs);
-            }
 
             try
             {
                 using (TaskScheduler.TaskService ts = new TaskScheduler.TaskService())
                 {
-                    // ¨ú±o«ü©w¸ê®Æ§¨
                     TaskScheduler.TaskFolder folder = ts.GetFolder(_taskPath);
                     if (folder != null)
                     {
                         foreach (var task in folder.Tasks)
                         {
-                            logs[task.Name] = GetTaskStateDescription(task.State) + "[" + GetErrorMessage(task.LastTaskResult) + "]";
+                            string status = GetTaskStateDescription(task.State) + "[" + GetErrorMessage(task.LastTaskResult) + "]";
+                            string status_text = task.State.ToString();
+                            logs[task.Name] = (status, status_text);
                         }
                     }
                 }
             }
             catch (Exception ex)
             {
-                result = $"Error reading task scheduler logs: {ex.Message}";
+                _logger.LogWarning($"è®€å–å·¥ä½œæ’ç¨‹å¤±æ•—: {ex.Message}");
             }
 
             return await Task.FromResult(logs);
         }
+
         private string GetTaskStateDescription(TaskScheduler.TaskState state)
         {
             return state switch
             {
-                TaskScheduler.TaskState.Unknown => "¥¼ª¾",
-                TaskScheduler.TaskState.Disabled => "¤w°±¥Î",
-                TaskScheduler.TaskState.Queued => "±Æ¶¤¤¤",
-                TaskScheduler.TaskState.Ready => "´Nºü",
-                TaskScheduler.TaskState.Running => "¥¿¦b¹B¦æ",
-                _ => "¥¼©w¸q"
+                TaskScheduler.TaskState.Unknown => "æœªçŸ¥",
+                TaskScheduler.TaskState.Disabled => "å·²åœç”¨",
+                TaskScheduler.TaskState.Queued => "æ’éšŠä¸­",
+                TaskScheduler.TaskState.Ready => "å°±ç·’",
+                TaskScheduler.TaskState.Running => "æ­£åœ¨é‹è¡Œ",
+                _ => "æœªå®šç¾©"
             };
         }
+
         private string GetErrorMessage(int errorCode)
         {
-            // ¹Á¸Õ¨ú±o¿ù»~´y­z
-            try
-            {
-                return new Win32Exception(errorCode).Message;
-            }
-            catch
-            {
-                return $"¥¼ª¾¿ù»~¡]¿ù»~½X: {errorCode}¡^";
-            }
+            try { return new Win32Exception(errorCode).Message; }
+            catch { return $"æœªçŸ¥éŒ¯èª¤ï¼ˆéŒ¯èª¤ç¢¼: {errorCode}ï¼‰"; }
         }
 
         /// <summary>
-        /// §ó·s¦@¨É¸ê®Æ§¨JsonÀÉ
+        /// æ›´æ–°å…±äº«è³‡æ–™å¤¾Jsonæª”ï¼ˆä¿ç•™æœ€è¿‘ _sharedJsonTotal ç­†ï¼‰
         /// </summary>
-        /// <param name="localFilePath"></param>
-        /// <returns></returns>
-        private SystemMonitor GetDataByQuantity(SystemMonitor loaclSystemMonitor)
+        private SystemMonitor GetDataByQuantity(SystemMonitor localSystemMonitor)
         {
-            string result = "";
-            SystemMonitor systemMonitor = new SystemMonitor();
+            SystemMonitor systemMonitor = localSystemMonitor ?? new SystemMonitor();
             try
             {
-                systemMonitor = loaclSystemMonitor;
                 if (_sharedJsonTotal > 0)
                 {
-                    List<SystemMonitorJson> newJsonList = new List<SystemMonitorJson>();
-                    for (int i = systemMonitor.JsonList.Count; systemMonitor.JsonList.Count < i; i--)
-                    {
-                        if (i == systemMonitor.JsonList.Count)
-                        {
-                            newJsonList.Add(systemMonitor.JsonList[i]);
-                        }
-                    }
-                    systemMonitor.JsonList = newJsonList;
+                    int count = systemMonitor.JsonList.Count;
+                    if (count > _sharedJsonTotal)
+                        systemMonitor.JsonList = systemMonitor.JsonList.Skip(count - _sharedJsonTotal).ToList();
                 }
-
                 return systemMonitor;
             }
             catch (Exception ex)
             {
-                result = $"Error: {ex.Message}";
+                _logger.LogWarning($"æ•´ç†å…±äº« JSON å¤±æ•—: {ex.Message}");
+                return systemMonitor;
             }
-            return systemMonitor;
         }
 
         /// <summary>
-        /// ¨ú±o¥»¾÷IP
+        /// å–å¾—æœ¬æ©ŸIPï¼ˆIPv4ï¼‰
         /// </summary>
-        /// <returns></returns>
         private string GetLocalIp()
         {
-            string result = "Unknown IP";
             try
             {
-                // ¨ú±o¥»¾÷ IP
                 var host = Dns.GetHostEntry(Dns.GetHostName());
                 foreach (var ip in host.AddressList)
                 {
                     if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                    {
                         return ip.ToString();
-                    }
                 }
+                return "Unknown IP";
             }
             catch
             {
-                result = "Unable to retrieve local IP address.";
+                return "Unable to retrieve local IP address.";
             }
-            return result;
         }
 
         /// <summary>
-        /// §R°£¹L´ÁÀÉ®×
+        /// åˆªé™¤éæœŸè³‡æ–™å¤¾ï¼ˆä¾æ—¥æœŸ yyyyMMddï¼‰
         /// </summary>
-        /// <returns></returns>
         private string DeleteOldFolders()
         {
             string result = "";
-            string[] pathList = { };
-
-            if (_sharedHost == 0)
-            {
-                pathList = new string[] { _localPath };
-            }
-            else
-            {
-                pathList = new string[] { _localPath, _sharedPath };
-            }
+            string[] pathList = (_sharedHost == 0) ? new[] { _localPath } : new[] { _localPath, _sharedPath };
 
             try
             {
-                for (int i = 0; pathList.Length > i; i++)
+                foreach (var path in pathList)
                 {
-                    string path = pathList[i];
-
-                    if (Directory.Exists(path) == false)
+                    if (!Directory.Exists(path))
                     {
-                        result += "folder does not exist: {" + path + "}\n";
+                        result += $"folder does not exist: {{{path}}}\n";
                         continue;
                     }
 
@@ -489,20 +515,18 @@ namespace SystemMonitoring
                     foreach (var folder in folders)
                     {
                         var folderName = Path.GetFileName(folder);
-
-                        // ÅçÃÒ¸ê®Æ§¨¦WºÙ¬O§_²Å¦X¤é´Á®æ¦¡
                         if (DateTime.TryParseExact(folderName, "yyyyMMdd", null, System.Globalization.DateTimeStyles.None, out var folderDate))
                         {
                             if (folderDate <= targetDate)
                             {
                                 try
                                 {
-                                    Directory.Delete(folder, true); // §R°£¸ê®Æ§¨
-                                    result += "Deleted folder: {" + folder + "}\n";
+                                    Directory.Delete(folder, true);
+                                    result += $"Deleted folder: {{{folder}}}\n";
                                 }
                                 catch (Exception ex)
                                 {
-                                    result += "Failed to delete folder: {" + folder + "}," + ex.Message + "\n";
+                                    result += $"Failed to delete folder: {{{folder}}},{ex.Message}\n";
                                 }
                             }
                         }

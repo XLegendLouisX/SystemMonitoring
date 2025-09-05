@@ -2,52 +2,29 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
+using static SystemMonitorJson;
 
 public class SystemMonitor
 {
     public int NotifyInterval { get; set; }
-    public List<string> NotifyRecord { get; set; }
+    public List<NotifyRecord> NotifyRecord { get; set; } = new List<NotifyRecord>();
     public List<SystemMonitorJson> JsonList { get; set; }
 
-    public SystemMonitor() 
+    public SystemMonitor()
     {
         JsonList = new List<SystemMonitorJson>();
-    }
-
-    // **取得 NotifyRecord 清單**
-    public List<string> GetNotifyRecord()
-    {
-        return NotifyRecord;
-    }
-
-    // **將新的通知記錄添加到 NotifyRecord**
-    public void AddNotifyRecord(string newRecord)
-    {
-        NotifyRecord.Add(newRecord);
-    }
-
-    // **刪除特定通知記錄**
-    public void RemoveNotifyRecord(string record)
-    {
-        NotifyRecord.Remove(record);
-    }
-
-    // **完全覆蓋 NotifyRecord**
-    public void UpdateNotifyRecord(List<string> newRecords)
-    {
-        NotifyRecord = newRecords;
     }
 }
 
 public class SystemMonitorJson
 {
-    public string HostIp { get; set; }
-    public string Timestamp { get; set; }
-    public string CpuUsage { get; set; }
-    public string MemoryUsage { get; set; }
-    public List<DiskUsageEntry> DiskUsage { get; set; }
-    public List<UrlStatusEntry> UrlStatus { get; set; }
-    public List<TaskLogEntry> TaskLogs { get; set; }
+    public string HostIp { get; set; } = string.Empty;
+    public string Timestamp { get; set; } = string.Empty;
+    public string CpuUsage { get; set; } = string.Empty;
+    public string MemoryUsage { get; set; } = string.Empty;
+    public List<DiskUsageEntry> DiskUsage { get; set; } = new List<DiskUsageEntry>();
+    public List<UrlStatusEntry> UrlStatus { get; set; } = new List<UrlStatusEntry>();
+    public List<TaskLogEntry> TaskLogs { get; set; } = new List<TaskLogEntry>();
 
     // 將物件序列化為 JSON
     public string ToJson()
@@ -58,21 +35,29 @@ public class SystemMonitorJson
     // 子類別 - 磁碟使用率
     public class DiskUsageEntry
     {
-        public string Drive { get; set; }
-        public string Usage { get; set; }
+        public string Drive { get; set; } = string.Empty;
+        public string Usage { get; set; } = string.Empty;
     }
 
     // 子類別 - URL 狀態
     public class UrlStatusEntry
     {
-        public string Url { get; set; }
+        public string Url { get; set; } = string.Empty;
         public int Status { get; set; }
+        public string Message { get; set; } = string.Empty;
     }
 
     // 子類別 - 排程任務紀錄
     public class TaskLogEntry
     {
-        public string Name { get; set; }
-        public string Status { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public string Status { get; set; } = string.Empty;
+        public string Status_Text { get; set; } = string.Empty;
+    }
+
+    public class NotifyRecord
+    {
+        public string NotifyTime { get; set; } = string.Empty;
+        public string NotifyText { get; set; } = string.Empty;
     }
 }
