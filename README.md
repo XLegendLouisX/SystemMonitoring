@@ -31,16 +31,19 @@ Json檔目前會記錄在兩個路徑，一個是本機，另一個是共享資�
   "SharedHost": 0, //是否為收集所有json檔的主機(0:否,1:是)(1會刪除SharedPath的資料)
   "TaskHost": 0, //是否監控排程(0:否,1:是)
   "UrlHost": 0, //是否監控URL(0:否,1:是)
-  "RunInterval": 5000, //執行間隔(毫秒)
-  "StorageDays": 60, //json保存天數
+  "StorageDays": 60, //json保存天數(天)
   "SharedJsonTotal": 0, //寫入共享資料夾Json數量(0:不限制)
-  "LocalPath": "D:\\SystemMonitoringLogs", //本機資料夾路徑
-  "SharedPath": "\\\\{ip}\\Share", //共享資料夾路徑
+  "LocalPath": "C:\\SystemMonitoringLogs", //本機資料夾路徑
+  "SharedPath": "C:\\SystemMonitoringLogs\\Share", //共享資料夾路徑
   "TaskPath": "\\", //排程路徑
-  "NotifyInterval": "1", //異常通知間隔(分鐘)(若不通知設定0)
+  "NotifyInterval": "5", //異常通知間隔(分鐘)(若不通知設定0)
+  "RequestTimeout": "60", //網頁請求時間(秒)
   "HttpUrls": [
     "https://www.google.com.tw"
-  ]
+  ],
+  "DiskEveryMinutes": 1, //硬體檢測時間間隔(分鐘)
+  "UrlEveryMinutes": 1, //網頁檢測時間間隔(分鐘)
+  "TaskEveryMinutes": 1 //排程檢測時間間隔(分鐘)
 }
 ```
 
