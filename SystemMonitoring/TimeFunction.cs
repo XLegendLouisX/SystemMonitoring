@@ -19,6 +19,9 @@ public static class TimeFunction
     // 取得「現在之後」最近的整 N 分鐘時間點（依指定時區對齊）
     public static DateTimeOffset GetNextByInterval(DateTimeOffset nowUtc, int minutes, TimeZoneInfo tz)
     {
+        if (minutes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(minutes), "minutes 必須 > 0");
+
         var local = TimeZoneInfo.ConvertTime(nowUtc, tz);
 
         // 取當小時的 00 分，再加上下一個區塊（ex: 每 10 分 → 10、20、30…）
@@ -36,6 +39,13 @@ public static class TimeFunction
         return candidateLocal.ToUniversalTime();
     }
 
-    public static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b, DateTimeOffset c)
-        => (a <= b && a <= c) ? a : (b <= a && b <= c) ? b : c;
+    public static DateTimeOffset Min(params DateTimeOffset[] values)
+    {
+        if (values == null || values.Length == 0)
+            throw new ArgumentException("必須至少提供一個時間值", nameof(values));
+        var min = values[0];
+        for (int i = 1; i < values.Length; i++)
+            if (values[i] < min) min = values[i];
+        return min;
+    }
 }

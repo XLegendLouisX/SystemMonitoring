@@ -25,6 +25,7 @@ public class SystemMonitorJson
     public List<DiskUsageEntry> DiskUsage { get; set; } = new List<DiskUsageEntry>();
     public List<UrlStatusEntry> UrlStatus { get; set; } = new List<UrlStatusEntry>();
     public List<TaskLogEntry> TaskLogs { get; set; } = new List<TaskLogEntry>();
+    public List<ServeLogEntry> ServeLogs { get; set; } = new List<ServeLogEntry>();
 
     // 將物件序列化為 JSON
     public string ToJson()
@@ -49,6 +50,14 @@ public class SystemMonitorJson
 
     // 子類別 - 排程任務紀錄
     public class TaskLogEntry
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Status { get; set; } = string.Empty;
+        public string Status_Text { get; set; } = string.Empty;
+    }
+
+    // 子類別 - 服務任務紀錄
+    public class ServeLogEntry
     {
         public string Name { get; set; } = string.Empty;
         public string Status { get; set; } = string.Empty;
